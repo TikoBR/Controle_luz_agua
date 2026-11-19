@@ -1,4 +1,4 @@
-# === APLICATIVO CONTROLE LUZ & ÁGUA - VERSÃO 1.18.2 ===
+# === APLICATIVO CONTROLE LUZ & ÁGUA - VERSÃO 1.19 ===
 import math
 import streamlit as st
 import streamlit.components.v1 as components
@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import gspread
 from google.oauth2.service_account import Credentials
 
-VERSAO_APP = "1.18.2"
+VERSAO_APP = "1.19"
 LIMITE_RELOGIO = 100000.0  # Virada total após 99999,99 -> 00000,00
 
 st.set_page_config(
@@ -259,13 +259,14 @@ def calcular_dias(inicio_str, fim_str, ultima_data_lida_str=None):
     except Exception:
         return 30, 1
 
-def calcular_projecao_luz_inteligente(df_dados, col_nome, dias_totais, dias_decorridos, janela_dias=6):
+def calcular_projecao_luz_inteligente(df_dados, col_nome, dias_totais, dias_decorridos, janela_dias=7):
     """
-    Calcula a projeção de fechamento da Luz:
+    Calcula a projeção de fechamento da Luz (Calibrada V1.19):
     - Abre e fecha o ciclo em número inteiro (padrão faturamento Light).
     - Suporta virada geral do relógio (99999 -> 00000).
-    - Para os dias restantes, pondera 60% o ritmo recente (últimos ~6 dias) + 40% a média geral do ciclo.
-    Retorna: (projecao_hibrida, projecao_media_geral, media_geral_dia, media_recente_dia)
+    - Nos primeiros 7 dias, usa 100% a média geral do ciclo (evita distorções na largada).
+    - A partir do 8º dia, pondera 75% média geral do ciclo + 25% ritmo da última semana (7d).
+    Retorna: (projecao_calibrada, projecao_media_geral, media_geral_dia, media_recente_dia)
     """
     if df_dados.empty or len(df_dados) < 1 or col_nome not in df_dados.columns or dias_decorridos <= 0:
         return 0.0, 0.0, 0.0, 0.0
@@ -287,34 +288,35 @@ def calcular_projecao_luz_inteligente(df_dados, col_nome, dias_totais, dias_deco
     proj_linear = (consumo_acumulado / dias_decorridos) * dias_totais
 
     media_recente = media_geral
-    try:
-        df_tmp = df_dados.copy()
-        df_tmp['Dt'] = pd.to_datetime(df_tmp['Data'], format='%d/%m/%Y', errors='coerce')
-        df_tmp['Val'] = df_tmp[col_nome].apply(safe_float)
-        df_tmp = df_tmp.dropna(subset=['Dt']).sort_values('Dt')
+    if dias_decorridos > janela_dias:
+        try:
+            df_tmp = df_dados.copy()
+            df_tmp['Dt'] = pd.to_datetime(df_tmp['Data'], format='%d/%m/%Y', errors='coerce')
+            df_tmp['Val'] = df_tmp[col_nome].apply(safe_float)
+            df_tmp = df_tmp.dropna(subset=['Dt']).sort_values('Dt')
 
-        if len(df_tmp) >= 2:
-            dt_ini = df_tmp['Dt'].iloc[0]
-            dt_ult = df_tmp['Dt'].iloc[-1]
-            val_ult = df_tmp['Val'].iloc[-1]
+            if len(df_tmp) >= 2:
+                dt_ini = df_tmp['Dt'].iloc[0]
+                dt_ult = df_tmp['Dt'].iloc[-1]
+                val_ult = df_tmp['Val'].iloc[-1]
 
-            # Busca uma leitura âncora próxima de 'janela_dias' atrás (mas posterior ao início do ciclo)
-            candidatos = df_tmp[(df_tmp['Dt'] > dt_ini) & (df_tmp['Dt'] < dt_ult)].copy()
-            if not candidatos.empty:
-                dt_alvo = dt_ult - pd.Timedelta(days=janela_dias)
-                candidatos['dist'] = (candidatos['Dt'] - dt_alvo).abs()
-                ancora = candidatos.sort_values('dist').iloc[0]
-                dias_jan = (dt_ult - ancora['Dt']).days
-                cons_jan = calcular_consumo_com_virada(val_ult, ancora['Val'], casas=2)
-                if dias_jan >= 1 and cons_jan >= 0:
-                    media_recente = cons_jan / dias_jan
-    except Exception:
-        media_recente = media_geral
+                # Busca uma leitura âncora próxima de 'janela_dias' (7 dias) atrás
+                candidatos = df_tmp[(df_tmp['Dt'] > dt_ini) & (df_tmp['Dt'] < dt_ult)].copy()
+                if not candidatos.empty:
+                    dt_alvo = dt_ult - pd.Timedelta(days=janela_dias)
+                    candidatos['dist'] = (candidatos['Dt'] - dt_alvo).abs()
+                    ancora = candidatos.sort_values('dist').iloc[0]
+                    dias_jan = (dt_ult - ancora['Dt']).days
+                    cons_jan = calcular_consumo_com_virada(val_ult, ancora['Val'], casas=2)
+                    if dias_jan >= 1 and cons_jan >= 0:
+                        media_recente = cons_jan / dias_jan
+        except Exception:
+            media_recente = media_geral
 
-    ritmo_futuro = (0.60 * media_recente) + (0.40 * media_geral)
-    proj_hibrida_bruta = consumo_acumulado + (dias_restantes * ritmo_futuro)
-    proj_hibrida = float(arredondar_excel(proj_hibrida_bruta, 2))
-    return proj_hibrida, float(arredondar_excel(proj_linear, 2)), media_geral, media_recente
+    ritmo_futuro = (0.75 * media_geral) + (0.25 * media_recente)
+    proj_calibrada_bruta = consumo_acumulado + (dias_restantes * ritmo_futuro)
+    proj_calibrada = float(arredondar_excel(proj_calibrada_bruta, 2))
+    return proj_calibrada, float(arredondar_excel(proj_linear, 2)), media_geral, media_recente
 
 def calcular_valor_fatura(projecao_kwh, valor_kwh, taxas_totais_ciclo, tem_taxas, tem_social, residuo_anterior=0.0):
     if projecao_kwh <= 0.0 and valor_kwh <= 0.0:
@@ -483,6 +485,10 @@ prev_agua = arredondar_excel((c_ciclo_agua / dias_decorridos_agua) * dias_totais
 rs_frente = calcular_valor_fatura(prev_frente, kwh_frente, taxas_totais, aplica_frente, soc_frente, res_frente)
 rs_cem = calcular_valor_fatura(prev_cem, kwh_cem, taxas_totais, aplica_cem, soc_cem, res_cem)
 rs_fundos = calcular_valor_fatura(prev_fundos, kwh_fundos, taxas_totais, aplica_fundos, soc_fundos, res_fundos)
+
+rs_lin_frente = calcular_valor_fatura(prev_lin_frente, kwh_frente, taxas_totais, aplica_frente, soc_frente, res_frente)
+rs_lin_cem = calcular_valor_fatura(prev_lin_cem, kwh_cem, taxas_totais, aplica_cem, soc_cem, res_cem)
+rs_lin_fundos = calcular_valor_fatura(prev_lin_fundos, kwh_fundos, taxas_totais, aplica_fundos, soc_fundos, res_fundos)
 
 if "recolher_menu" not in st.session_state:
     st.session_state["recolher_menu"] = 0
@@ -689,13 +695,13 @@ elif menu in ["Frente", "100", "Fundos"]:
     
     if menu == "Frente":
         c_hoje, p_fech, p_lin, m_ger, m_rec = c_hoje_frente, prev_frente, prev_lin_frente, med_g_frente, med_r_frente
-        l_ini, l_atu, v_rs, v_res = ini_frente_int, ultima_frente, rs_frente, res_frente
+        l_ini, l_atu, v_rs, v_lin_rs, v_res = ini_frente_int, ultima_frente, rs_frente, rs_lin_frente, res_frente
     elif menu == "100":
         c_hoje, p_fech, p_lin, m_ger, m_rec = c_hoje_cem, prev_cem, prev_lin_cem, med_g_cem, med_r_cem
-        l_ini, l_atu, v_rs, v_res = ini_cem_int, ultima_cem, rs_cem, res_cem
+        l_ini, l_atu, v_rs, v_lin_rs, v_res = ini_cem_int, ultima_cem, rs_cem, rs_lin_cem, res_cem
     else:
         c_hoje, p_fech, p_lin, m_ger, m_rec = c_hoje_fundos, prev_fundos, prev_lin_fundos, med_g_fundos, med_r_fundos
-        l_ini, l_atu, v_rs, v_res = ini_fundos_int, ultima_fundos, rs_fundos, res_fundos
+        l_ini, l_atu, v_rs, v_lin_rs, v_res = ini_fundos_int, ultima_fundos, rs_fundos, rs_lin_fundos, res_fundos
         
     variacao_ideal = c_hoje - meta_ideal_diaria
     delta_str = f"{variacao_ideal:+.1f} kWh" if abs(variacao_ideal) > 0.01 else "0.0 kWh"
@@ -703,7 +709,7 @@ elif menu in ["Frente", "100", "Fundos"]:
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Consumo Hoje", f"{c_hoje:.1f} kWh", delta_str, delta_color="inverse")
-        st.metric("Previsão (Tendência)", f"{p_fech:.1f} kWh (R$ {v_rs:.2f})")
+        st.metric("Previsão Fechamento", f"{p_fech:.1f} kWh (R$ {v_rs:.2f})")
     with col2:
         st.metric("Ideal para o Dia", f"{meta_ideal_diaria:.1f} kWh", " ", delta_color="off") 
         st.metric("Dias Restantes", f"{max(0, dias_totais_luz - dias_decorridos_luz)} dias")
@@ -712,7 +718,8 @@ elif menu in ["Frente", "100", "Fundos"]:
     info_abaixo50 = " *(Abaixo de R$ 50,00: se fechar assim, acumula p/ próx. ciclo)*" if 0 < v_rs < 50.0 else ""
     st.caption(
         f"🔢 Leitura: Início **{l_ini}** → Atual **{l_atu:.1f}** (Fechamento Inteiro: **{truncar_inteiro(l_atu)}**) | "
-        f"📈 Média Ciclo: **{m_ger:.2f} kWh/d** | 🔥 Ritmo Recente (6d): **{m_rec:.2f} kWh/d** (Linear: {p_lin:.1f} kWh){info_res}{info_abaixo50}"
+        f"📈 Média Ciclo: **{m_ger:.2f} kWh/d** | 🔥 Ritmo 7d: **{m_rec:.2f} kWh/d** "
+        f"(Linear: {p_lin:.1f} kWh / R$ {v_lin_rs:.2f}){info_res}{info_abaixo50}"
     )
 
 elif menu == "Água":
@@ -792,8 +799,9 @@ elif menu == "Resumo dos Ciclos":
         if (res_frente + res_cem + res_fundos) > 0:
             nota_acumulo = f" | 💰 *Inclui resíduo acumulado do ciclo anterior (Frente: R$ {res_frente:.2f}, 100: R$ {res_cem:.2f}, Fundos: R$ {res_fundos:.2f}).*"
         st.caption(
-            f"💡 *Previsão por Tendência (60% últimos 6 dias + 40% média do ciclo). "
-            f"Média simples linear: Frente {prev_lin_frente:.1f} kWh | 100 {prev_lin_cem:.1f} kWh | Fundos {prev_lin_fundos:.1f} kWh. "
+            f"💡 *Previsão Calibrada (75% média do ciclo + 25% últimos 7 dias). "
+            f"Ref. Linear pura: Frente {prev_lin_frente:.1f} kWh (R$ {rs_lin_frente:.2f}) | "
+            f"100+Fundos {prev_lin_cem + prev_lin_fundos:.1f} kWh (R$ {rs_lin_cem + rs_lin_fundos:.2f}). "
             f"Valores individuais marcados com (*) estão abaixo de R$ 50,00 (se fecharem assim, acumulam para o próximo ciclo).* {nota_acumulo}"
         )
     else:
@@ -1113,4 +1121,4 @@ elif menu == "Configuração de Ciclo":
                             st.rerun()
                         except Exception as e:
                             st.error(f"⚠️ Erro ao atualizar Linha 2 da Água: {e}")
-# === FIM DO CÓDIGO - VERSÃO 1.18.2 ===
+# === FIM DO CÓDIGO - VERSÃO 1.19 ===
